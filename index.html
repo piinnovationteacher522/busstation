@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>專營巴士到站時間 - micro:bit 通訊</title>
+<style>
+  :root {
+    --primary: #c31b31; 
+    --surface: #ffffff;
+    --background: #f4f4f9;
+    --text: #333333;
+    --border: #dddddd;
+    --danger: #dc3545;
+    --success: #28a745;
+  }
+  * {
+    box-sizing: border-box;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  body {
+    background-color: var(--background);
+    color: var(--text);
+    margin: 0;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .container {
+    width: 100%;
+    max-width: 500px;
+    background: var(--surface);
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  h1 {
+    font-size: 1.5rem;
+    text-align: center;
+    color: var(--primary);
+    margin-top: 0;
+  }
+  .form-group {
+    margin-bottom: 20px;
+  }
+  label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: bold;
+  }
+  .input-row {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+  }
+  input[type="text"], select {
+    width: 100%;
+    padding: 12px;
+    font-size: 1.1rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background-color: white;
+  }
+  input[type="text"] {
+    text-transform: uppercase;
+  }
+  button {
+    width: 100%;
+    padding: 14px;
+    font-size: 1.1rem;
+    font-weight: bold;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    margin-bottom: 12px;
+    transition: background-color 0.3s, opacity 0.2s;
+  }
+  button:active {
+    opacity: 0.8;
+  }
+  .btn-primary { background-color: var(--primary); color: white; }
+  .btn-blue { background-color: #007aff; color: white; }
+  .btn-gray { background-color: #5c5c5c; color: white; }
+  .btn-danger { background-color: var(--danger); color: white; }
+  .btn-success { background-color: var(--success); color: white; }
+  .btn-search {
+    width: auto;
+    margin-bottom: 0;
+    white-space: nowrap;
+    padding: 12px 16px;
+  }
+  #status, #etaResult {
+    padding: 12px;
+    border-radius: 8px;
+    margin-bottom: 16px;
+    text-align: center;
+    font-size: 1rem;
+    word-break: break-word;
+  }
+  .success { background: #e6ffed; color: #1e7e34; border: 1px solid #c3e6cb; }
+  .error   { background: #ffe6e6; color: #c82333; border: 1px solid #f5c6cb; }
+  .info    { background: #e8f4fd; color: #0056b3; border: 1px solid #b8daff; }
+  .warning { background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+  
+  .conn-buttons {
+    display: flex;
+    gap: 10px;
+  }
+  .conn-buttons button { margin-bottom: 0; }
+  .auto-reconnect-btn { display: none; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <h1>巴士 ETA 微控制器通訊</h1>
+  
+  <div id="status" class="info">請選擇連線方式</div>
+
+  <button class="btn-success auto-reconnect-btn" id="reconnectBtn">⚡ 恢復上次連線</button>
+  
+  <div class="conn-buttons" id="manualConnBtns">
+    <button class="btn-blue" id="connectBluetooth">連線 (藍牙)</button>
+    <button class="btn-gray" id="connectUSB">連線 (USB)</button>
+  </div>
+
+  <hr style="border: 0; border-top: 1px solid var(--border); margin: 24px 0;">
+
+  <div class="form-group">
+    <label for="routeInput">巴士公司及路線:</label>
+    <div class="input-row">
+      <select id="companySelect" style="flex: 1.2; padding: 12px 8px;">
+        <option value="kmb">九巴 (KMB)</option>
+        <option value="ctb">城巴 (CTB)</option>
+      </select>
+      <input type="text" id="routeInput" style="flex: 1.5;" placeholder="例如: 1A, 8X" autocomplete="off">
+      <button class="btn-blue btn-search" id="searchRouteBtn" style="flex: 1;">搜尋</button>
+    </div>
+  </div>
+
+  <div class="form-group" id="stopGroup" style="display: none;">
+    <label for="stopSelect">選擇方向及站名:</label>
+    <select id="stopSelect"></select>
+  </div>
+
+  <button class="btn-primary" id="autoFetchBtn">開始自動發送到站時間 (每10秒)</button>
+  
+  <div id="etaResult" style="display: none;"></div>
+</div>
+
+<script>
+/* ==================== micro:bit 通訊 ==================== */
+
+const UART_SERVICE_UUID         = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const UART_TX_CHARACTERISTIC_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; 
+const UART_RX_CHARACTERISTIC_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; 
+
+let uBitDevice = null;         
+let rxCharacteristic = null;   
+let serialPort = null;         
+
+const onMicrobitReceive = new EventTarget();
+
+function setStatus(msg, type = 'info') {
+  const el = document.getElementById("status");
+  el.textContent = msg;
+  el.className = type;
+}
+
+function showResult(msg, type = 'info') {
+  const el = document.getElementById("etaResult");
+  el.style.display = 'block';
+  el.textContent = msg;
+  el.className = type;
+}
+
+function updateConnUI(connected) {
+    if (connected) {
+        document.getElementById("manualConnBtns").style.display = "none";
+        document.getElementById("reconnectBtn").style.display = "none";
+    } else {
+        document.getElementById("manualConnBtns").style.display = "flex";
+        if (localStorage.getItem("bus_conn_type")) {
+            document.getElementById("reconnectBtn").style.display = "block";
+        }
+    }
+}
+
+/* --- 連線處理邏輯 --- */
+async function setupBluetooth(device) {
+    try {
+        uBitDevice = device;
+        uBitDevice.addEventListener("gattserverdisconnected", onBluetoothDisconnected);
+        const server = await uBitDevice.gatt.connect();
+        const service = await server.getPrimaryService(UART_SERVICE_UUID);
+        
+        const txChar = await service.getCharacteristic(UART_TX_CHARACTERISTIC_UUID);
+        await txChar.startNotifications();
+        txChar.addEventListener("characteristicvaluechanged", handleBluetoothData);
+        
+        rxCharacteristic = await service.getCharacteristic(UART_RX_CHARACTERISTIC_UUID);
+        
+localStorage.setItem("bus_conn_type", "ble");
+        setStatus("✅ 藍牙已成功連接到 micro:bit", "success");
+        updateConnUI(true);
+        
+        // --- 針對 Bluefy 瀏覽器的特殊優化 ---
+        if (navigator.bluetooth.setScreenDimEnabled) {
+             // 禁止螢幕休眠，確保 10 秒自動更新不會被 iOS 凍結
+             navigator.bluetooth.setScreenDimEnabled(false);
+             console.log("Bluefy: 螢幕休眠已停用，保持常亮");
+        }
+        
+        // (選用) 監聽背景切換，當滑出 App 時發送提示到 micro:bit
+        if (navigator.bluetooth.addEventListener) {
+             navigator.bluetooth.addEventListener("backgroundstatechanged", (e) => {
+                 if (e.state === "background") {
+                     console.log("App 進入背景，自動更新將暫停！");
+                     sendToMicrobit("Phone Background!\\n"); 
+                 } else if (e.state === "foreground") {
+                     console.log("App 回到前台，恢復運作");
+                     if(isAutoFetching) fetchAndSendEta(); // 回來時立刻抓一次資料
+                 }
+             });
+        }
+        // ------------------------------------
+
+        return true;
+    } catch (err) {
+        setStatus("❌ 藍牙連接失敗: " + err.message, "error");
+        updateConnUI(false);
+        throw err;
+    }
+}
+
+async function setupUSB(port) {
+    try {
+        serialPort = port;
+        await serialPort.open({ baudRate: 115200 });
+        
+        localStorage.setItem("bus_conn_type", "usb");
+        setStatus("✅ USB 已成功連接到 micro:bit", "success");
+        updateConnUI(true);
+        
+        const reader = serialPort.readable.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        
+        (async () => {
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    let lines = buffer.split("\n");
+                    buffer = lines.pop(); 
+                    for (let line of lines) {
+                        line = line.trim();
+                        if (line) onMicrobitReceive.dispatchEvent(new CustomEvent("data", { detail: line }));
+                    }
+                }
+            } catch (e) {
+                console.error(e);
+                setStatus("⚠️ USB 讀取發生錯誤或已拔除", "error");
+                onUSBDisconnected();
+            }
+        })();
+        return true;
+    } catch (err) {
+        setStatus("❌ USB 連接失敗: " + err.message, "error");
+        updateConnUI(false);
+        throw err;
+    }
+}
+
+function onBluetoothDisconnected() {
+  setStatus("⚠️ micro:bit 藍牙已斷線", "error");
+  uBitDevice = null;
+  rxCharacteristic = null;
+  stopAutoFetch();
+  updateConnUI(false);
+}
+
+function onUSBDisconnected() {
+  serialPort = null;
+  stopAutoFetch();
+  updateConnUI(false);
+}
+
+function handleBluetoothData(event) {
+  const value = event.target.value;
+  const text = new TextDecoder().decode(value).trim();
+  if (text) onMicrobitReceive.dispatchEvent(new CustomEvent("data", { detail: text }));
+}
+
+async function connectBluetooth() {
+  try {
+    setStatus("正在搜尋 micro:bit (藍牙)...", "info");
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "BBC micro:bit" }],
+      optionalServices: [UART_SERVICE_UUID]
+    });
+    await setupBluetooth(device);
+  } catch (err) {
+    setStatus("❌ 藍牙搜尋取消或失敗: " + err.message, "error");
+  }
+}
+
+async function connectUSB() {
+  try {
+    setStatus("請選擇 micro:bit 的序列埠 (USB)...", "info");
+    const port = await navigator.serial.requestPort();
+    await setupUSB(port);
+  } catch (err) {
+    setStatus("❌ USB 選擇取消或失敗: " + err.message, "error");
+  }
+}
+
+async function tryAutoConnect(isUserInitiated = false) {
+    // 相容舊設定或新設定
+    const lastType = localStorage.getItem("bus_conn_type") || localStorage.getItem("kmb_conn_type");
+    if (!lastType) return;
+    
+    setStatus(`正在嘗試恢復上次的 ${lastType.toUpperCase()} 連線...`, "info");
+    document.getElementById("reconnectBtn").style.display = "none";
+    
+    try {
+        if (lastType === "usb" && navigator.serial) {
+            const ports = await navigator.serial.getPorts();
+            if (ports.length > 0) {
+                await setupUSB(ports[0]);
+                return;
+            } else throw new Error("未找到已授權的 USB 裝置");
+        } else if (lastType === "ble" && navigator.bluetooth && navigator.bluetooth.getDevices) {
+            const devices = await navigator.bluetooth.getDevices();
+            const uBit = devices.find(d => d.name && d.name.startsWith("BBC micro:bit"));
+            if (uBit) {
+                await setupBluetooth(uBit);
+                return;
+            } else throw new Error("未找到已授權的藍牙裝置");
+        } else throw new Error("瀏覽器不支援自動獲取裝置");
+    } catch (err) {
+        if (isUserInitiated) setStatus(`無法恢復連線 (${err.message})，請重新手動配對。`, "error");
+        else setStatus("請點擊「恢復上次連線」按鈕或重新配對", "info");
+        updateConnUI(false);
+    }
+}
+
+async function sendToMicrobit(message) {
+  const data = message + "\n"; 
+  const encoder = new TextEncoder();
+  try {
+    if (serialPort?.writable) {
+      const writer = serialPort.writable.getWriter();
+      await writer.write(encoder.encode(data));
+      writer.releaseLock();
+      return true;
+    }
+    if (rxCharacteristic) {
+      await rxCharacteristic.writeValue(encoder.encode(data));
+      return true;
+    }
+    return false;
+  } catch (err) {
+    console.error("發送失敗:", err);
+    return false;
+  }
+}
+
+/* ==================== 巴士 API 及業務邏輯 ==================== */
+
+let stopsDict = {};
+let isFetchingStops = false;
+let isKmbStopsLoaded = false;
+let autoFetchInterval = null;
+let isAutoFetching = false;
+
+// 獲取九巴全港站名
+async function getKmbStopsDict() {
+    if (isKmbStopsLoaded) return;
+    if (isFetchingStops) {
+        while(isFetchingStops) await new Promise(r => setTimeout(r, 100));
+        return;
+    }
+    isFetchingStops = true;
+    showResult("首次載入：正在下載九巴全港站點資料，這可能需要幾秒鐘...", "info");
+    try {
+        const res = await fetch("https://data.etabus.gov.hk/v1/transport/kmb/stop");
+        if(res.ok) {
+            const json = await res.json();
+            if(json.data) {
+                json.data.forEach(s => stopsDict[s.stop] = s.name_tc);
+                isKmbStopsLoaded = true;
+            }
+        }
+    } catch (e) {
+        console.error("載入九巴站點失敗", e);
+    }
+    isFetchingStops = false;
+}
+
+// 搜尋路線站點
+async function searchRoute(route, company) {
+  if (!route) return;
+  showResult(`正在搜尋 ${company.toUpperCase()} ${route} 的路線及站點資訊...`, "info");
+  document.getElementById("stopGroup").style.display = "none";
+  stopAutoFetch(); 
+  
+  try {
+    let routeInfo = {};
+    let allStops = [];
+
+    if (company === 'kmb') {
+        const routeRes = await fetch(`https://data.etabus.gov.hk/v1/transport/kmb/route/${route}`);
+        const routeJson = await routeRes.json();
+        if (routeJson.data && Array.isArray(routeJson.data)) {
+            routeJson.data.forEach(r => {
+                if (r.service_type == "1" || !routeInfo[r.bound]) routeInfo[r.bound] = r.dest_tc;
+            });
+        }
+        const outRes = await fetch(`https://data.etabus.gov.hk/v1/transport/kmb/route-stop/${route}/outbound/1`);
+        const outJson = await outRes.json().catch(()=>({}));
+        const inRes = await fetch(`https://data.etabus.gov.hk/v1/transport/kmb/route-stop/${route}/inbound/1`);
+        const inJson = await inRes.json().catch(()=>({}));
+
+        if (outJson.data && Array.isArray(outJson.data)) allStops = allStops.concat(outJson.data.map(d => ({...d, dir: 'O'})));
+        if (inJson.data && Array.isArray(inJson.data)) allStops = allStops.concat(inJson.data.map(d => ({...d, dir: 'I'})));
+
+        await getKmbStopsDict();
+
+    } else if (company === 'ctb') {
+        const routeRes = await fetch(`https://rt.data.gov.hk/v2/transport/citybus/route/ctb/${route}`);
+        const routeJson = await routeRes.json();
+        let rData = routeJson.data;
+        if (rData) {
+            if (Array.isArray(rData)) rData = rData[0];
+            routeInfo['O'] = rData.dest_tc;
+            routeInfo['I'] = rData.orig_tc;
+        }
+
+        const outRes = await fetch(`https://rt.data.gov.hk/v2/transport/citybus/route-stop/ctb/${route}/outbound`);
+        const outJson = await outRes.json().catch(()=>({}));
+        const inRes = await fetch(`https://rt.data.gov.hk/v2/transport/citybus/route-stop/ctb/${route}/inbound`);
+        const inJson = await inRes.json().catch(()=>({}));
+
+        if (outJson.data && Array.isArray(outJson.data)) allStops = allStops.concat(outJson.data.map(d => ({...d, dir: 'O'})));
+        if (inJson.data && Array.isArray(inJson.data)) allStops = allStops.concat(inJson.data.map(d => ({...d, dir: 'I'})));
+
+        // 獲取城巴缺失的站名
+        if (allStops.length > 0) {
+            const missingStopIds = [...new Set(allStops.map(s => s.stop).filter(id => !stopsDict[id]))];
+            if (missingStopIds.length > 0) {
+                showResult("正在下載城巴站點名稱，請稍候...", "info");
+                const chunks = [];
+                for(let i=0; i<missingStopIds.length; i+=5) chunks.push(missingStopIds.slice(i, i+5));
+                for (const chunk of chunks) {
+                  await Promise.all(chunk.map(async id => {
+                    try {
+                      const sRes = await fetch(`https://rt.data.gov.hk/v2/transport/citybus/stop/${id}`).then(r=>r.json());
+                      if (sRes.data && sRes.data.name_tc) stopsDict[id] = sRes.data.name_tc;
+                    } catch (e) {}
+                  }));
+                }
+            }
+        }
+    }
+
+    if (allStops.length === 0) {
+        showResult(`找不到 ${company.toUpperCase()} 路線 ${route} 的站點資料，請檢查號碼與巴士公司是否正確。`, "error");
+        return;
+    }
+
+    const selectEl = document.getElementById("stopSelect");
+    selectEl.innerHTML = "";
+    
+    allStops.forEach(s => {
+        const option = document.createElement("option");
+        option.value = `${company}_${s.dir}_${s.seq}_${s.stop}`;
+        let destName = routeInfo[s.dir] || (s.dir === 'O' ? '去程' : '回程');
+        let stopName = stopsDict[s.stop] || s.stop;
+        option.textContent = `[往 ${destName}] 第${s.seq}站: ${stopName}`;
+        selectEl.appendChild(option);
+    });
+
+    document.getElementById("stopGroup").style.display = "block";
+    showResult(`${company.toUpperCase()} 路線 ${route} 站點載入完成，請選擇所需站點。`, "success");
+    
+    const savedStop = localStorage.getItem("bus_stop_val") || localStorage.getItem("kmb_stop_val");
+    if (savedStop && Array.from(selectEl.options).some(opt => opt.value === savedStop)) {
+        selectEl.value = savedStop;
+    } else {
+        localStorage.setItem("bus_stop_val", selectEl.value);
+    }
+  } catch (err) {
+    showResult(`搜尋路線失敗: ${err.message}`, "error");
+  }
+}
+
+async function fetchAndSendEta() {
+  const route = document.getElementById("routeInput").value.trim().toUpperCase();
+  const selectEl = document.getElementById("stopSelect");
+  
+  if (!route || selectEl.options.length === 0 || selectEl.style.display === "none") {
+      stopAutoFetch();
+      showResult("請先確認路線及站點已正確載入", "error");
+      return;
+  }
+  
+  const stopVal = selectEl.value; 
+  const parts = stopVal.split("_");
+  let stopCompany, dir, seq, stopId;
+  if (parts.length === 4) {
+      [stopCompany, dir, seq, stopId] = parts;
+  } else {
+      [dir, seq, stopId] = parts;
+      stopCompany = "kmb"; // 相容舊版快取資料
+  }
+  
+  const stopNameText = selectEl.options[selectEl.selectedIndex].text;
+  const nowTime = new Date().toLocaleTimeString('zh-HK', { hour12: false });
+
+  try {
+    let validEtas = [];
+
+    if (stopCompany === 'kmb') {
+        try {
+            const stopEtaRes = await fetch(`https://data.etabus.gov.hk/v1/transport/kmb/eta/${stopId}/${route}/1`);
+            if (stopEtaRes.ok) {
+                const stopEtaJson = await stopEtaRes.json();
+                if (stopEtaJson.data && Array.isArray(stopEtaJson.data)) {
+                    validEtas = stopEtaJson.data.filter(d => d.dir === dir && d.seq.toString() === seq.toString() && d.eta !== null);
+                }
+            }
+        } catch (e) {}
+        if (validEtas.length === 0) {
+            const routeEtaRes = await fetch(`https://data.etabus.gov.hk/v1/transport/kmb/route-eta/${route}/1`);
+            if (routeEtaRes.ok) {
+                const routeEtaJson = await routeEtaRes.json();
+                if (routeEtaJson.data && Array.isArray(routeEtaJson.data)) {
+                    validEtas = routeEtaJson.data.filter(d => d.dir === dir && d.seq.toString() === seq.toString() && d.eta !== null);
+                }
+            }
+        }
+    } else if (stopCompany === 'ctb') {
+        try {
+            const stopEtaRes = await fetch(`https://rt.data.gov.hk/v2/transport/citybus/eta/ctb/${stopId}/${route}`);
+            if (stopEtaRes.ok) {
+                const stopEtaJson = await stopEtaRes.json();
+                if (stopEtaJson.data && Array.isArray(stopEtaJson.data)) {
+                    validEtas = stopEtaJson.data.filter(d => d.dir === dir && d.eta !== null);
+                    // 過濾序列以確保是同一個站點 (避免循環線重複站名)
+                    validEtas = validEtas.filter(d => d.seq === undefined || d.seq.toString() === seq.toString());
+                }
+            }
+        } catch (e) {}
+    }
+
+    if (validEtas.length === 0) {
+        showResult(`[${nowTime}] 該站點 (${stopNameText}) 暫時沒有預計到站時間。`, "warning");
+        return;
+    }
+
+    validEtas.sort((a, b) => new Date(a.eta) - new Date(b.eta));
+    const nextBus = validEtas[0];
+    
+    const etaDate = new Date(nextBus.eta);
+    let diffMins = Math.round((etaDate - new Date()) / 60000);
+    if (diffMins < 0) diffMins = 0;
+
+    const msg = `${route},${diffMins}`;
+    const sendSuccess = await sendToMicrobit(msg);
+    
+    let rmkInfo = nextBus.rmk_tc ? ` (${nextBus.rmk_tc})` : "";
+    let stopDisplayName = stopsDict[stopId] || stopId;
+
+    if (sendSuccess) {
+      showResult(`[${nowTime}] 自動發送成功: ${msg}\n(下一班大約 ${diffMins} 分鐘後到達 ${stopDisplayName}${rmkInfo})`, "success");
+    } else {
+      showResult(`[${nowTime}] 獲取成功，但未能發送至 micro:bit (請確認已連線)。\n準備發送字串: ${msg}`, "error");
+    }
+
+  } catch (err) {
+    showResult(`[${nowTime}] 獲取資料失敗: ` + err.message, "error");
+  }
+}
+
+function startAutoFetch() {
+    const route = document.getElementById("routeInput").value.trim().toUpperCase();
+    const selectEl = document.getElementById("stopSelect");
+    
+    if (!route || selectEl.options.length === 0 || selectEl.style.display === "none") {
+        showResult("請先點擊「搜尋路線」並確認站點已載入", "error");
+        return;
+    }
+
+    isAutoFetching = true;
+    const btn = document.getElementById("autoFetchBtn");
+    btn.textContent = "停止自動發送 (每 10 秒刷新)";
+    btn.classList.remove("btn-primary");
+    btn.classList.add("btn-danger");
+    
+    fetchAndSendEta();
+    autoFetchInterval = setInterval(fetchAndSendEta, 10000);
+}
+
+function stopAutoFetch() {
+    isAutoFetching = false;
+    clearInterval(autoFetchInterval);
+    autoFetchInterval = null;
+    
+    const btn = document.getElementById("autoFetchBtn");
+    btn.textContent = "開始自動發送到站時間 (每10秒)";
+    btn.classList.remove("btn-danger");
+    btn.classList.add("btn-primary");
+}
+
+/* ==================== 綁定事件 ==================== */
+
+document.getElementById("autoFetchBtn").addEventListener("click", () => {
+    if (isAutoFetching) {
+        stopAutoFetch();
+        showResult("已停止自動發送。", "info");
+    } else startAutoFetch();
+});
+
+document.getElementById("searchRouteBtn").addEventListener("click", () => {
+    const route = document.getElementById("routeInput").value.trim().toUpperCase();
+    const company = document.getElementById("companySelect").value;
+    if (route) {
+        localStorage.setItem("bus_company", company);
+        localStorage.setItem("bus_route", route);
+        searchRoute(route, company);
+    } else showResult("請輸入巴士路線號碼", "error");
+});
+
+document.getElementById("stopSelect").addEventListener("change", (e) => {
+    localStorage.setItem("bus_stop_val", e.target.value);
+    if(isAutoFetching) fetchAndSendEta();
+});
+
+document.getElementById("connectBluetooth").addEventListener("click", connectBluetooth);
+document.getElementById("connectUSB").addEventListener("click", connectUSB);
+document.getElementById("reconnectBtn").addEventListener("click", () => tryAutoConnect(true));
+
+// 初始化
+document.addEventListener("DOMContentLoaded", () => {
+  updateConnUI(false);
+  tryAutoConnect(false);
+
+  // 讀取快取
+  const savedCompany = localStorage.getItem("bus_company") || localStorage.getItem("kmb_conn_type") ? "kmb" : "kmb"; 
+  if (localStorage.getItem("bus_company")) document.getElementById("companySelect").value = localStorage.getItem("bus_company");
+
+  const savedRoute = localStorage.getItem("bus_route") || localStorage.getItem("kmb_route");
+  if (savedRoute) {
+    document.getElementById("routeInput").value = savedRoute;
+    searchRoute(savedRoute, document.getElementById("companySelect").value);
+  }
+});
+</script>
+</body>
+</html>
